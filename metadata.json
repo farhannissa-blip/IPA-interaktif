@@ -1,0 +1,6 @@
+{
+  "name": "Siklus Air 3D — Diorama Interaktif IPA Kelas 5 SD",
+  "description": "Simulasi 3D interaktif yang mewah dan elegan untuk mempelajari tahapan siklus air (Evaporasi, Transpirasi, Kondensasi, Presipitasi, dan Infiltrasi) sesuai materi IPA Kelas 5 SD dengan respons sentuhan layar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,676 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import {
+  STAGE_ORDER,
+  WATER_CYCLE_STAGES,
+  WaterCycleStageId,
+} from '../data/waterCycleData';
+import { BuiltDiorama, buildLuxuryDiorama } from './dioramaBuilder';
+import { createProceduralTextures, ProceduralTextureSet } from './proceduralTextures';
+import { WaterCycleParticleSystem } from './waterCycleParticles';
+
+export type InteractiveZoneId = Exclude<WaterCycleStageId, 'overview'>;
+export type QualityMode = 'ringan' | 'tinggi';
+
+export interface HotspotScreenPosition {
+  id: InteractiveZoneId;
+  x: number;
+  y: number;
+  visible: boolean;
+}
+
+export interface EngineCallbacks {
+  onStageSelect: (stageId: WaterCycleStageId, fromTouch: boolean) => void;
+  onHotspotsProject: (positions: HotspotScreenPosition[]) => void;
+  onContextLost?: () => void;
+  onContextRestored?: () => void;
+}
+
+// Module-scope scratch math objects (Zero GC in render loop)
+const _camGoalPos = new THREE.Vector3();
+const _camGoalTarget = new THREE.Vector3();
+const _projVec = new THREE.Vector3();
+const _rayMouse = new THREE.Vector2();
+const _targetBgColor = new THREE.Color();
+const _targetSkyTopColor = new THREE.Color();
+const _targetFloorColor = new THREE.Color();
+const _targetSunColor = new THREE.Color();
+const _targetHemiSky = new THREE.Color();
+const _targetHemiGround = new THREE.Color();
+const _cloudLightColor = new THREE.Color(0xffffff);
+const _cloudStormColor = new THREE.Color(0x415268);
+const _cloudUnderLight = new THREE.Color(0xb6cde3);
+const _cloudUnderStorm = new THREE.Color(0x222f40);
+const _tempColor = new THREE.Color();
+const _fallbackRipplePos = new THREE.Vector3();
+
+const INTERACTIVE_ZONES: InteractiveZoneId[] = [
+  'evaporasi',
+  'transpirasi',
+  'kondensasi',
+  'presipitasi',
+  'infiltrasi',
+];
+
+export function detectRecommendedQuality(): QualityMode {
+  if (typeof window === 'undefined') return 'ringan';
+  const isTouchPrimary =
+    window.matchMedia?.('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+  const screenPixels = window.innerWidth * window.innerHeight * Math.min(window.devicePixelRatio || 1, 2);
+  const lowCores = typeof navigator.hardwareConcurrency === 'number' && navigator.hardwareConcurrency <= 4;
+  // Default to Mode Ringan on phones, tablets, touch PIDs, 4K screens, or low-core CPUs
+  if (isTouchPrimary || screenPixels > 2_000_000 || lowCores || window.innerWidth < 1024) {
+    return 'ringan';
+  }
+  return 'tinggi';
+}
+
+function detectSoftwareWebGL(): boolean {
+  try {
+    const probeCanvas = document.createElement('canvas');
+    const gl = probeCanvas.getContext('webgl2');
+    if (!gl) return true;
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+    const gpu = String(gl.getParameter(param) || '');
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+  } catch {
+    return true;
+  }
+}
+
+export class WaterCycleEngine {
+  private container: HTMLElement;
+  private callbacks: EngineCallbacks;
+  private isSoftwareGl: boolean;
+  private qualityMode: QualityMode;
+
+  private renderer: THREE.WebGLRenderer;
+  private scene: THREE.Scene;
+  private camera: THREE.PerspectiveCamera;
+  private controls: OrbitControls;
+  private envRenderTarget: THREE.WebGLRenderTarget;
+
+  private textures: ProceduralTextureSet;
+  private diorama: BuiltDiorama;
+  private particles: WaterCycleParticleSystem;
+
+  // Lightweight 3-point lighting rig (no heavy RectAreaLight)
+  private sunLight: THREE.DirectionalLight;
+  private hemiLight: THREE.HemisphereLight;
+  private rimLight: THREE.DirectionalLight;
+  private fillLight: THREE.DirectionalLight;
+  private fog: THREE.FogExp2;
+
+  // Raycaster & pointer tracking
+  private raycaster = new THREE.Raycaster();
+  private pointerDownX = 0;
+  private pointerDownY = 0;
+  private pointerDownTime = 0;
+  private lastHoverCheck = 0;
+  private hoveredStage: WaterCycleStageId | null = null;
+
+  // Animation & camera transition state
+  private activeStage: WaterCycleStageId = 'overview';
+  private cameraTransitioning = false;
+  private frameId = 0;
+  private disposed = false;
+  private paused = false;
+  private lastTimestamp = performance.now();
+  private elapsedTime = 0;
+  private currentCloudDarkness = 0.12;
+  private lightningTimer = 0;
+  private hotspotPositions: HotspotScreenPosition[] = INTERACTIVE_ZONES.map((id) => ({
+    id,
+    x: -9999,
+    y: -9999,
+    visible: false,
+  }));
+
+  constructor(
+    container: HTMLElement,
+    callbacks: EngineCallbacks,
+    initialQuality: QualityMode = 'ringan'
+  ) {
+    this.container = container;
+    this.callbacks = callbacks;
+    this.isSoftwareGl = detectSoftwareWebGL();
+    this.qualityMode = initialQuality;
+
+    const width = Math.max(container.clientWidth, 1);
+    const height = Math.max(container.clientHeight, 1);
+
+    // 1. Lightweight Modern PBR WebGLRenderer with Software-WebGL & Mobile/PID Pixel Budget Guard
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: !this.isSoftwareGl && initialQuality === 'tinggi',
+      powerPreference: 'high-performance',
+    });
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.applyQualitySettings(width, height);
+
+    this.renderer.domElement.style.display = 'block';
+    this.renderer.domElement.style.width = '100%';
+    this.renderer.domElement.style.height = '100%';
+    container.appendChild(this.renderer.domElement);
+
+    // 2. Scene, Horizon-Matched Fog & Studio RoomEnvironment IBL
+    this.scene = new THREE.Scene();
+    const initialMood = WATER_CYCLE_STAGES.overview.mood;
+    this.scene.background = new THREE.Color(initialMood.bgHex);
+    this.fog = new THREE.FogExp2(initialMood.fogHex, initialMood.fogDensity);
+    this.scene.fog = this.fog;
+
+    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
+    this.envRenderTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
+    this.scene.environment = this.envRenderTarget.texture;
+    pmremGenerator.dispose();
+
+    // 3. Perspective Camera & Damped OrbitControls
+    this.camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 120);
+    this.camera.position.set(...WATER_CYCLE_STAGES.overview.cameraPosition);
+
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.target.set(...WATER_CYCLE_STAGES.overview.cameraTarget);
+    this.controls.enableDamping = !this.isSoftwareGl;
+    this.controls.dampingFactor = 0.07;
+    this.controls.enablePan = false;
+    this.controls.minDistance = 6.2;
+    this.controls.maxDistance = 28.5;
+    this.controls.minPolarAngle = 0.18;
+    this.controls.maxPolarAngle = Math.PI * 0.485;
+    this.controls.rotateSpeed = 0.72;
+    this.controls.zoomSpeed = 0.85;
+    this.controls.update();
+
+    this.controls.addEventListener('start', this.onControlsStart);
+
+    // 4. Lightweight 3-Point Studio Lighting Rig (zero RectAreaLight shader overhead)
+    this.hemiLight = new THREE.HemisphereLight(
+      initialMood.hemiSkyHex,
+      initialMood.hemiGroundHex,
+      initialMood.hemiIntensity
+    );
+    this.hemiLight.position.set(0, 22, 0);
+    this.scene.add(this.hemiLight);
+
+    this.sunLight = new THREE.DirectionalLight(initialMood.sunColorHex, initialMood.sunIntensity);
+    this.sunLight.position.set(10.5, 13.5, 5.5);
+    this.sunLight.castShadow = !this.isSoftwareGl && this.qualityMode === 'tinggi';
+    this.sunLight.shadow.mapSize.set(1024, 1024);
+    this.sunLight.shadow.camera.near = 2;
+    this.sunLight.shadow.camera.far = 32;
+    this.sunLight.shadow.camera.left = -9.2;
+    this.sunLight.shadow.camera.right = 9.2;
+    this.sunLight.shadow.camera.top = 9.2;
+    this.sunLight.shadow.camera.bottom = -9.2;
+    this.sunLight.shadow.bias = -0.0005;
+    this.sunLight.shadow.normalBias = 0.025;
+    this.scene.add(this.sunLight);
+
+    this.rimLight = new THREE.DirectionalLight(0x8ec8ff, initialMood.rimIntensity);
+    this.rimLight.position.set(-11, 8.5, -10.5);
+    this.scene.add(this.rimLight);
+
+    // Subtle front-gallery fill light (fast directional replacement for expensive RectAreaLight)
+    this.fillLight = new THREE.DirectionalLight(0xffebd0, 0.48);
+    this.fillLight.position.set(6, 5, 11);
+    this.scene.add(this.fillLight);
+
+    // 5. Procedural Textures, Composite Luxury Diorama & Particle Systems
+    this.textures = createProceduralTextures(this.renderer.capabilities.getMaxAnisotropy());
+    this.diorama = buildLuxuryDiorama(this.textures);
+    this.diorama.skyUniforms.uTopColor.value.setHex(initialMood.skyTopHex);
+    this.diorama.skyUniforms.uHorizonColor.value.setHex(initialMood.bgHex);
+    this.diorama.studioFloorMat.color.setHex(initialMood.bgHex).multiplyScalar(0.92);
+    this.scene.add(this.diorama.root);
+
+    this.particles = new WaterCycleParticleSystem(this.textures);
+    this.particles.setDensityScale(this.qualityMode === 'ringan' ? 0.68 : 1.0);
+    this.scene.add(this.particles.group);
+
+    this.raycaster.layers.set(1);
+
+    if (!this.isSoftwareGl) {
+      this.renderer.compile(this.scene, this.camera);
+    }
+
+    this.bindEvents();
+    this.lastTimestamp = performance.now();
+    this.tick();
+  }
+
+  /**
+   * Dynamically computes an optimal internal pixel ratio capped by total rendered pixels,
+   * preventing 4K Interactive Flat Panels (PID) and 3x DPR smartphones from choking on fill-rate.
+   */
+  private computeOptimalPixelRatio(width: number, height: number): number {
+    if (this.isSoftwareGl) return 1;
+    const dpr = window.devicePixelRatio || 1;
+    const area = Math.max(width * height, 1);
+
+    if (this.qualityMode === 'ringan') {
+      // Max ~1.05M pixels internal render budget (silky smooth on Android PID 4K & budget phones)
+      const maxPixels = 1_050_000;
+      const areaBasedRatio = Math.sqrt(maxPixels / area);
+      return THREE.MathUtils.clamp(Math.min(dpr, 1.0, areaBasedRatio), 0.58, 1.0);
+    } else {
+      // High mode: crisp up to 1.5x DPR, capped at ~2.3M pixels
+      const maxPixels = 2_300_000;
+      const areaBasedRatio = Math.sqrt(maxPixels / area);
+      return THREE.MathUtils.clamp(Math.min(dpr, 1.5, areaBasedRatio), 0.75, 1.5);
+    }
+  }
+
+  private applyQualitySettings(width: number, height: number): void {
+    const pixelRatio = this.computeOptimalPixelRatio(width, height);
+    this.renderer.setPixelRatio(pixelRatio);
+    this.renderer.setSize(width, height);
+
+    const enableShadows = !this.isSoftwareGl && this.qualityMode === 'tinggi';
+    this.renderer.shadowMap.enabled = enableShadows;
+    if (this.sunLight) {
+      this.sunLight.castShadow = enableShadows;
+    }
+    if (this.particles) {
+      this.particles.setDensityScale(this.qualityMode === 'ringan' ? 0.68 : 1.0);
+    }
+    this.renderer.shadowMap.needsUpdate = true;
+  }
+
+  public setQualityMode(mode: QualityMode): void {
+    if (this.qualityMode === mode || this.disposed) return;
+    this.qualityMode = mode;
+    const width = Math.max(this.container.clientWidth, 1);
+    const height = Math.max(this.container.clientHeight, 1);
+    this.applyQualitySettings(width, height);
+  }
+
+  private onControlsStart = (): void => {
+    this.cameraTransitioning = false;
+  };
+
+  private bindEvents(): void {
+    const dom = this.renderer.domElement;
+    dom.addEventListener('pointerdown', this.onPointerDown);
+    dom.addEventListener('pointerup', this.onPointerUp);
+    dom.addEventListener('pointermove', this.onPointerMove);
+    dom.addEventListener('webglcontextlost', this.onContextLost, false);
+    dom.addEventListener('webglcontextrestored', this.onContextRestored, false);
+    window.addEventListener('resize', this.onResize);
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+  }
+
+  private onVisibilityChange = (): void => {
+    if (document.hidden) {
+      this.paused = true;
+      cancelAnimationFrame(this.frameId);
+      window.clearTimeout(this.frameId);
+    } else if (!this.disposed && this.paused) {
+      this.paused = false;
+      this.lastTimestamp = performance.now();
+      this.tick();
+    }
+  };
+
+  private onContextLost = (event: Event): void => {
+    event.preventDefault();
+    this.callbacks.onContextLost?.();
+  };
+
+  private onContextRestored = (): void => {
+    this.callbacks.onContextRestored?.();
+  };
+
+  private onResize = (): void => {
+    if (this.disposed) return;
+    const width = Math.max(this.container.clientWidth, 1);
+    const height = Math.max(this.container.clientHeight, 1);
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+    this.applyQualitySettings(width, height);
+  };
+
+  private setRayMouseFromEvent(e: PointerEvent): void {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    _rayMouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    _rayMouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  private onPointerDown = (e: PointerEvent): void => {
+    this.pointerDownX = e.clientX;
+    this.pointerDownY = e.clientY;
+    this.pointerDownTime = performance.now();
+  };
+
+  private onPointerMove = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch') return;
+    const now = performance.now();
+    if (now - this.lastHoverCheck < 75) return;
+    this.lastHoverCheck = now;
+
+    this.setRayMouseFromEvent(e);
+    this.raycaster.setFromCamera(_rayMouse, this.camera);
+    const hits = this.raycaster.intersectObjects(this.diorama.interactableProxies, false);
+    const nextHover =
+      hits.length > 0 ? (hits[0].object.userData.stageId as WaterCycleStageId) : null;
+
+    if (nextHover !== this.hoveredStage) {
+      this.hoveredStage = nextHover;
+      this.renderer.domElement.style.cursor = nextHover ? 'pointer' : 'grab';
+    }
+  };
+
+  private onPointerUp = (e: PointerEvent): void => {
+    const dx = e.clientX - this.pointerDownX;
+    const dy = e.clientY - this.pointerDownY;
+    const moveDist = Math.hypot(dx, dy);
+    const elapsedMs = performance.now() - this.pointerDownTime;
+
+    if (moveDist > 10 || elapsedMs > 400) return;
+
+    this.setRayMouseFromEvent(e);
+    this.raycaster.setFromCamera(_rayMouse, this.camera);
+    const hits = this.raycaster.intersectObjects(this.diorama.interactableProxies, false);
+
+    if (hits.length > 0) {
+      const hit = hits[0];
+      const hitStage = hit.object.userData.stageId as WaterCycleStageId;
+      const targetStage =
+        hitStage !== this.activeStage
+          ? hitStage
+          : STAGE_ORDER[(STAGE_ORDER.indexOf(this.activeStage) + 1) % STAGE_ORDER.length];
+
+      this.particles.triggerTouchRipple(hit.point, WATER_CYCLE_STAGES[targetStage].accentHex);
+      this.setStage(targetStage, true);
+      this.callbacks.onStageSelect(targetStage, true);
+    } else {
+      const nextIdx = (STAGE_ORDER.indexOf(this.activeStage) + 1) % STAGE_ORDER.length;
+      const nextStage = STAGE_ORDER[nextIdx];
+      _fallbackRipplePos.set(...WATER_CYCLE_STAGES[nextStage].hotspotWorldPos);
+      this.particles.triggerTouchRipple(_fallbackRipplePos, WATER_CYCLE_STAGES[nextStage].accentHex);
+      this.setStage(nextStage, true);
+      this.callbacks.onStageSelect(nextStage, true);
+    }
+  };
+
+  public setStage(stageId: WaterCycleStageId, withCameraGlide = true): void {
+    this.activeStage = stageId;
+    const stage = WATER_CYCLE_STAGES[stageId];
+    _camGoalPos.set(...stage.cameraPosition);
+    _camGoalTarget.set(...stage.cameraTarget);
+    if (withCameraGlide) {
+      this.cameraTransitioning = true;
+    }
+  }
+
+  public resetCamera(): void {
+    const stage = WATER_CYCLE_STAGES[this.activeStage];
+    _camGoalPos.set(...stage.cameraPosition);
+    _camGoalTarget.set(...stage.cameraTarget);
+    this.cameraTransitioning = true;
+  }
+
+  public setFlowGuidesVisible(visible: boolean): void {
+    this.particles.setFlowGuidesVisible(visible);
+  }
+
+  private afterDraw(cb: () => void): void {
+    const gl = this.renderer.getContext() as WebGL2RenderingContext;
+    if (gl && typeof gl.fenceSync === 'function') {
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      gl.flush();
+      const poll = () => {
+        if (this.disposed || this.paused) return;
+        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+        if (state === gl.UNSIGNALED) {
+          this.frameId = window.setTimeout(poll, 5);
+        } else {
+          if (sync) gl.deleteSync(sync);
+          this.frameId = window.setTimeout(cb, 80);
+        }
+      };
+      this.frameId = window.setTimeout(poll, 5);
+    } else {
+      this.frameId = window.setTimeout(cb, 80);
+    }
+  }
+
+  private tick = (): void => {
+    if (this.disposed || this.paused) return;
+
+    const now = performance.now();
+    const rawDt = (now - this.lastTimestamp) / 1000;
+    this.lastTimestamp = now;
+    const dt = Math.min(Math.max(rawDt, 0.001), 0.08);
+    this.elapsedTime += dt;
+
+    this.updateScene(dt, this.elapsedTime);
+    this.renderer.render(this.scene, this.camera);
+    this.projectHotspots();
+
+    if (this.isSoftwareGl) {
+      this.afterDraw(this.tick);
+    } else {
+      this.frameId = requestAnimationFrame(this.tick);
+    }
+  };
+
+  private updateScene(dt: number, elapsed: number): void {
+    const stage = WATER_CYCLE_STAGES[this.activeStage];
+    const mood = stage.mood;
+    const damp = 1 - Math.exp(-3.2 * dt);
+
+    if (this.cameraTransitioning) {
+      const camDamp = 1 - Math.exp(-4.2 * dt);
+      this.camera.position.lerp(_camGoalPos, camDamp);
+      this.controls.target.lerp(_camGoalTarget, camDamp);
+      if (
+        this.camera.position.distanceToSquared(_camGoalPos) < 0.002 &&
+        this.controls.target.distanceToSquared(_camGoalTarget) < 0.002
+      ) {
+        this.camera.position.copy(_camGoalPos);
+        this.controls.target.copy(_camGoalTarget);
+        this.cameraTransitioning = false;
+      }
+    }
+    this.controls.update();
+
+    _targetBgColor.setHex(mood.bgHex);
+    _targetSkyTopColor.setHex(mood.skyTopHex);
+    _targetFloorColor.copy(_targetBgColor).multiplyScalar(0.92);
+    (this.scene.background as THREE.Color).lerp(_targetBgColor, damp);
+    this.fog.color.lerp(_targetBgColor, damp);
+    this.fog.density += (mood.fogDensity - this.fog.density) * damp;
+    this.diorama.skyUniforms.uTopColor.value.lerp(_targetSkyTopColor, damp);
+    this.diorama.skyUniforms.uHorizonColor.value.lerp(_targetBgColor, damp);
+    this.diorama.studioFloorMat.color.lerp(_targetFloorColor, damp);
+
+    _targetSunColor.setHex(mood.sunColorHex);
+    this.sunLight.color.lerp(_targetSunColor, damp);
+    this.sunLight.intensity += (mood.sunIntensity - this.sunLight.intensity) * damp;
+
+    _targetHemiSky.setHex(mood.hemiSkyHex);
+    _targetHemiGround.setHex(mood.hemiGroundHex);
+    this.hemiLight.color.lerp(_targetHemiSky, damp);
+    this.hemiLight.groundColor.lerp(_targetHemiGround, damp);
+    this.hemiLight.intensity += (mood.hemiIntensity - this.hemiLight.intensity) * damp;
+    this.rimLight.intensity += (mood.rimIntensity - this.rimLight.intensity) * damp;
+    this.renderer.toneMappingExposure +=
+      (mood.exposure - this.renderer.toneMappingExposure) * damp;
+
+    this.diorama.sunRaysGroup.rotation.z = elapsed * 0.28;
+    this.diorama.sunRaysGroup.rotation.y = Math.sin(elapsed * 0.4) * 0.25;
+    const targetBeamOpacity =
+      this.activeStage === 'evaporasi'
+        ? 0.22
+        : this.activeStage === 'transpirasi'
+          ? 0.13
+          : this.activeStage === 'presipitasi'
+            ? 0.02
+            : 0.1;
+    this.diorama.sunBeamMat.opacity += (targetBeamOpacity - this.diorama.sunBeamMat.opacity) * damp;
+    const targetSunEmissive =
+      this.activeStage === 'evaporasi' ? 2.2 : this.activeStage === 'presipitasi' ? 1.0 : 1.75;
+    this.diorama.sunCoreMat.emissiveIntensity +=
+      (targetSunEmissive - this.diorama.sunCoreMat.emissiveIntensity) * damp;
+
+    this.diorama.oceanUniforms.uTime.value = elapsed;
+    const targetWaveAmp = this.activeStage === 'presipitasi' ? 0.075 : 0.048;
+    this.diorama.oceanUniforms.uWaveAmp.value +=
+      (targetWaveAmp - this.diorama.oceanUniforms.uWaveAmp.value) * damp;
+
+    const targetEvapGlow =
+      this.activeStage === 'evaporasi'
+        ? 1.0
+        : this.activeStage === 'overview'
+          ? 0.34
+          : this.activeStage === 'presipitasi'
+            ? 0.04
+            : 0.14;
+    this.diorama.oceanUniforms.uEvapGlow.value +=
+      (targetEvapGlow - this.diorama.oceanUniforms.uEvapGlow.value) * damp;
+
+    const targetInfilGlow =
+      this.activeStage === 'infiltrasi'
+        ? 1.0
+        : this.activeStage === 'overview'
+          ? 0.28
+          : 0.1;
+    this.diorama.oceanUniforms.uInfilGlow.value +=
+      (targetInfilGlow - this.diorama.oceanUniforms.uInfilGlow.value) * damp;
+
+    // Subtle dynamic water specular gloss: mirror-like shimmer during Evaporasi & Infiltrasi
+    const targetOceanRough =
+      this.activeStage === 'evaporasi' || this.activeStage === 'infiltrasi'
+        ? 0.08
+        : this.activeStage === 'presipitasi'
+          ? 0.19
+          : 0.12;
+    this.diorama.oceanMaterial.roughness +=
+      (targetOceanRough - this.diorama.oceanMaterial.roughness) * damp;
+
+    const targetRiverRough = this.activeStage === 'infiltrasi' ? 0.08 : 0.13;
+    this.diorama.riverMaterial.roughness +=
+      (targetRiverRough - this.diorama.riverMaterial.roughness) * damp;
+
+    this.textures.waterNormalBump.offset.x = (elapsed * 0.045) % 1;
+    this.textures.waterNormalBump.offset.y = (elapsed * 0.028) % 1;
+
+    this.diorama.boatGroup.position.y =
+      this.diorama.boatBasePos.y + Math.sin(elapsed * 1.9) * 0.032;
+    this.diorama.boatGroup.rotation.z = Math.sin(elapsed * 1.55 + 0.6) * 0.045;
+    this.diorama.boatGroup.rotation.x = Math.cos(elapsed * 1.3) * 0.035;
+
+    const targetAquiferEmissive =
+      this.activeStage === 'infiltrasi' ? 1.55 : this.activeStage === 'overview' ? 0.72 : 0.45;
+    this.diorama.aquiferGlowMaterial.emissiveIntensity +=
+      (targetAquiferEmissive - this.diorama.aquiferGlowMaterial.emissiveIntensity) * damp;
+
+    this.currentCloudDarkness += (mood.cloudDarkness - this.currentCloudDarkness) * damp;
+    for (let i = 0; i < this.diorama.clouds.length; i++) {
+      const c = this.diorama.clouds[i];
+      const bobY = Math.sin(elapsed * 0.65 + c.phase) * 0.11;
+      const swayX = Math.cos(elapsed * 0.35 + c.phase) * 0.18;
+      c.group.position.set(c.basePos.x + swayX, c.basePos.y + bobY, c.basePos.z);
+
+      const swell =
+        this.activeStage === 'kondensasi' && c.role !== 'storm'
+          ? 1.12
+          : this.activeStage === 'presipitasi' && c.role === 'storm'
+            ? 1.14
+            : 1.0;
+      const s = THREE.MathUtils.lerp(c.group.scale.x, c.baseScale * swell, damp);
+      c.group.scale.setScalar(s);
+
+      const roleFactor =
+        c.role === 'storm'
+          ? Math.min(this.currentCloudDarkness * 1.15 + 0.15, 1.0)
+          : this.currentCloudDarkness * 0.68;
+
+      _tempColor.copy(_cloudLightColor).lerp(_cloudStormColor, roleFactor);
+      c.materials[0].color.copy(_tempColor);
+      _tempColor.copy(_cloudUnderLight).lerp(_cloudUnderStorm, roleFactor);
+      c.materials[1].color.copy(_tempColor);
+    }
+
+    if (this.activeStage === 'presipitasi') {
+      this.lightningTimer -= dt;
+      if (this.lightningTimer <= 0) {
+        this.diorama.lightningLight.intensity = 6.5;
+        this.lightningTimer = 2.6 + Math.random() * 2.8;
+      } else {
+        this.diorama.lightningLight.intensity *= Math.exp(-8.5 * dt);
+      }
+    } else {
+      this.diorama.lightningLight.intensity *= Math.exp(-6.0 * dt);
+    }
+
+    this.particles.update(dt, elapsed, this.activeStage);
+  }
+
+  private projectHotspots(): void {
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    if (width <= 0 || height <= 0) return;
+
+    let anyChanged = false;
+    for (let i = 0; i < INTERACTIVE_ZONES.length; i++) {
+      const id = INTERACTIVE_ZONES[i];
+      const worldPos = WATER_CYCLE_STAGES[id].hotspotWorldPos;
+      _projVec.set(worldPos[0], worldPos[1], worldPos[2]).project(this.camera);
+
+      const inFront = _projVec.z >= -1 && _projVec.z <= 1;
+      const sx = ((_projVec.x + 1) * 0.5) * width;
+      const sy = ((-_projVec.y + 1) * 0.5) * height;
+      const onScreen = inFront && sx > 36 && sx < width - 36 && sy > 52 && sy < height - 96;
+
+      const prev = this.hotspotPositions[i];
+      if (
+        prev.visible !== onScreen ||
+        Math.abs(prev.x - sx) > 0.45 ||
+        Math.abs(prev.y - sy) > 0.45
+      ) {
+        prev.x = sx;
+        prev.y = sy;
+        prev.visible = onScreen;
+        anyChanged = true;
+      }
+    }
+
+    if (anyChanged) {
+      this.callbacks.onHotspotsProject(this.hotspotPositions);
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    cancelAnimationFrame(this.frameId);
+    window.clearTimeout(this.frameId);
+
+    const dom = this.renderer.domElement;
+    dom.removeEventListener('pointerdown', this.onPointerDown);
+    dom.removeEventListener('pointerup', this.onPointerUp);
+    dom.removeEventListener('pointermove', this.onPointerMove);
+    dom.removeEventListener('webglcontextlost', this.onContextLost);
+    dom.removeEventListener('webglcontextrestored', this.onContextRestored);
+    window.removeEventListener('resize', this.onResize);
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
+
+    this.controls.removeEventListener('start', this.onControlsStart);
+    this.controls.dispose();
+    this.particles.dispose();
+    this.diorama.disposables.forEach((d) => d.dispose());
+    this.textures.dispose();
+    this.envRenderTarget.dispose();
+    this.renderer.dispose();
+
+    if (dom.parentNode === this.container) {
+      this.container.removeChild(dom);
+    }
+  }
+}
