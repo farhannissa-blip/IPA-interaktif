@@ -9,6 +9,7 @@ export interface ProceduralTextureSet {
   contactShadow: THREE.CanvasTexture;
   mistSprite: THREE.CanvasTexture;
   glowSprite: THREE.CanvasTexture;
+  sunGlowSprite: THREE.CanvasTexture;
   dispose: () => void;
 }
 
@@ -220,6 +221,51 @@ export function createProceduralTextures(maxAnisotropy: number): ProceduralTextu
   glowSprite.minFilter = THREE.LinearFilter;
   glowSprite.magFilter = THREE.LinearFilter;
 
+  // 8. Natural Radiant Round Sun Glow & Soft Sunburst Corona Sprite (128x128)
+  const [sunCanvas, sunCtx] = makeCanvas(128, 128);
+  const cx = 64;
+  const cy = 64;
+  // Soft organic radial light rays (subtle natural daylight glare)
+  sunCtx.save();
+  sunCtx.translate(cx, cy);
+  for (let i = 0; i < 16; i++) {
+    const angle = (i / 16) * Math.PI * 2;
+    const rayLen = i % 2 === 0 ? 60 : 48;
+    const rayWidth = i % 2 === 0 ? 0.14 : 0.1;
+    sunCtx.save();
+    sunCtx.rotate(angle);
+    const rayGrad = sunCtx.createLinearGradient(0, 0, rayLen, 0);
+    rayGrad.addColorStop(0.0, 'rgba(255, 250, 215, 0.34)');
+    rayGrad.addColorStop(0.45, 'rgba(255, 224, 128, 0.14)');
+    rayGrad.addColorStop(1.0, 'rgba(255, 200, 80, 0.0)');
+    sunCtx.fillStyle = rayGrad;
+    sunCtx.beginPath();
+    sunCtx.moveTo(0, 0);
+    sunCtx.lineTo(rayLen, -rayLen * rayWidth);
+    sunCtx.lineTo(rayLen, rayLen * rayWidth);
+    sunCtx.closePath();
+    sunCtx.fill();
+    sunCtx.restore();
+  }
+  sunCtx.restore();
+
+  // Concentric bright incandescent sun bloom
+  const sRad = sunCtx.createRadialGradient(cx, cy, 2, cx, cy, 62);
+  sRad.addColorStop(0.0, 'rgba(255, 255, 248, 1.0)');
+  sRad.addColorStop(0.18, 'rgba(255, 248, 204, 0.96)');
+  sRad.addColorStop(0.36, 'rgba(255, 226, 122, 0.62)');
+  sRad.addColorStop(0.62, 'rgba(255, 198, 76, 0.24)');
+  sRad.addColorStop(0.84, 'rgba(255, 178, 52, 0.06)');
+  sRad.addColorStop(1.0, 'rgba(255, 170, 40, 0.0)');
+  sunCtx.fillStyle = sRad;
+  sunCtx.fillRect(0, 0, 128, 128);
+
+  const sunGlowSprite = new THREE.CanvasTexture(sunCanvas);
+  sunGlowSprite.colorSpace = THREE.SRGBColorSpace;
+  sunGlowSprite.generateMipmaps = false;
+  sunGlowSprite.minFilter = THREE.LinearFilter;
+  sunGlowSprite.magFilter = THREE.LinearFilter;
+
   return {
     strataColor,
     strataBump,
@@ -229,6 +275,7 @@ export function createProceduralTextures(maxAnisotropy: number): ProceduralTextu
     contactShadow,
     mistSprite,
     glowSprite,
+    sunGlowSprite,
     dispose: () => {
       strataColor.dispose();
       strataBump.dispose();
@@ -238,6 +285,7 @@ export function createProceduralTextures(maxAnisotropy: number): ProceduralTextu
       contactShadow.dispose();
       mistSprite.dispose();
       glowSprite.dispose();
+      sunGlowSprite.dispose();
     },
   };
 }

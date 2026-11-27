@@ -8,7 +8,9 @@ import {
 } from '../data/waterCycleData';
 import { BuiltDiorama, buildLuxuryDiorama } from './dioramaBuilder';
 import { createProceduralTextures, ProceduralTextureSet } from './proceduralTextures';
+import { oceanWaveHeightAt } from './terrainMath';
 import { WaterCycleParticleSystem } from './waterCycleParticles';
+import { WaterCycleWildlifeSystem } from './wildlifeSystem';
 
 export type InteractiveZoneId = Exclude<WaterCycleStageId, 'overview'>;
 export type QualityMode = 'ringan' | 'tinggi';
@@ -44,6 +46,12 @@ const _cloudUnderLight = new THREE.Color(0xb6cde3);
 const _cloudUnderStorm = new THREE.Color(0x222f40);
 const _tempColor = new THREE.Color();
 const _fallbackRipplePos = new THREE.Vector3();
+const _ropeStart = new THREE.Vector3();
+const _ropeEnd = new THREE.Vector3();
+const _ropeMid = new THREE.Vector3();
+const _ropeDir = new THREE.Vector3();
+const _ropeQuat = new THREE.Quaternion();
+const _yAxis = new THREE.Vector3(0, 1, 0);
 
 const INTERACTIVE_ZONES: InteractiveZoneId[] = [
   'evaporasi',
@@ -96,6 +104,7 @@ export class WaterCycleEngine {
   private textures: ProceduralTextureSet;
   private diorama: BuiltDiorama;
   private particles: WaterCycleParticleSystem;
+  private wildlife: WaterCycleWildlifeSystem;
 
   // Lightweight 3-point lighting rig (no heavy RectAreaLight)
   private sunLight: THREE.DirectionalLight;
@@ -180,7 +189,7 @@ export class WaterCycleEngine {
     this.controls.dampingFactor = 0.07;
     this.controls.enablePan = false;
     this.controls.minDistance = 6.2;
-    this.controls.maxDistance = 28.5;
+    this.controls.maxDistance = 33.5;
     this.controls.minPolarAngle = 0.18;
     this.controls.maxPolarAngle = Math.PI * 0.485;
     this.controls.rotateSpeed = 0.72;
@@ -199,15 +208,15 @@ export class WaterCycleEngine {
     this.scene.add(this.hemiLight);
 
     this.sunLight = new THREE.DirectionalLight(initialMood.sunColorHex, initialMood.sunIntensity);
-    this.sunLight.position.set(10.5, 13.5, 5.5);
+    this.sunLight.position.set(12.5, 16.8, 5.0);
     this.sunLight.castShadow = !this.isSoftwareGl && this.qualityMode === 'tinggi';
     this.sunLight.shadow.mapSize.set(1024, 1024);
     this.sunLight.shadow.camera.near = 2;
-    this.sunLight.shadow.camera.far = 32;
-    this.sunLight.shadow.camera.left = -9.2;
-    this.sunLight.shadow.camera.right = 9.2;
-    this.sunLight.shadow.camera.top = 9.2;
-    this.sunLight.shadow.camera.bottom = -9.2;
+    this.sunLight.shadow.camera.far = 38;
+    this.sunLight.shadow.camera.left = -10.5;
+    this.sunLight.shadow.camera.right = 11.5;
+    this.sunLight.shadow.camera.top = 11.0;
+    this.sunLight.shadow.camera.bottom = -10.0;
     this.sunLight.shadow.bias = -0.0005;
     this.sunLight.shadow.normalBias = 0.025;
     this.scene.add(this.sunLight);
@@ -232,6 +241,9 @@ export class WaterCycleEngine {
     this.particles = new WaterCycleParticleSystem(this.textures);
     this.particles.setDensityScale(this.qualityMode === 'ringan' ? 0.68 : 1.0);
     this.scene.add(this.particles.group);
+
+    this.wildlife = new WaterCycleWildlifeSystem();
+    this.scene.add(this.wildlife.group);
 
     this.raycaster.layers.set(1);
 
@@ -503,26 +515,53 @@ export class WaterCycleEngine {
     this.renderer.toneMappingExposure +=
       (mood.exposure - this.renderer.toneMappingExposure) * damp;
 
-    this.diorama.sunRaysGroup.rotation.z = elapsed * 0.28;
-    this.diorama.sunRaysGroup.rotation.y = Math.sin(elapsed * 0.4) * 0.25;
+    // Animate natural blazing round sun photosphere & radiant camera-facing corona sprites
+    this.diorama.sunUniforms.uTime.value = elapsed;
+    const targetSunBright =
+      this.activeStage === 'evaporasi'
+        ? 1.45
+        : this.activeStage === 'presipitasi'
+          ? 0.35
+          : 1.05;
+    this.diorama.sunUniforms.uBrightness.value +=
+      (targetSunBright - this.diorama.sunUniforms.uBrightness.value) * damp;
+
+    const pulse = 1.0 + Math.sin(elapsed * 2.1) * 0.045;
+    const flareScale = (this.activeStage === 'evaporasi' ? 4.8 : this.activeStage === 'presipitasi' ? 2.8 : 4.1) * pulse;
+    const auraScale = (this.activeStage === 'evaporasi' ? 8.0 : this.activeStage === 'presipitasi' ? 4.4 : 6.8) * (1.0 + Math.cos(elapsed * 1.4) * 0.04);
+    const curFlare = THREE.MathUtils.lerp(this.diorama.sunInnerFlare.scale.x, flareScale, damp);
+    const curAura = THREE.MathUtils.lerp(this.diorama.sunOuterAura.scale.x, auraScale, damp);
+    this.diorama.sunInnerFlare.scale.set(curFlare, curFlare, 1);
+    this.diorama.sunOuterAura.scale.set(curAura, curAura, 1);
+
+    const targetInnerOp =
+      this.activeStage === 'evaporasi' ? 1.0 : this.activeStage === 'presipitasi' ? 0.45 : 0.92;
+    const targetOuterOp =
+      this.activeStage === 'evaporasi' ? 0.68 : this.activeStage === 'presipitasi' ? 0.2 : 0.52;
+    const targetHaloOp =
+      this.activeStage === 'evaporasi' ? 0.48 : this.activeStage === 'presipitasi' ? 0.14 : 0.36;
+    this.diorama.sunInnerFlareMat.opacity +=
+      (targetInnerOp - this.diorama.sunInnerFlareMat.opacity) * damp;
+    this.diorama.sunOuterAuraMat.opacity +=
+      (targetOuterOp - this.diorama.sunOuterAuraMat.opacity) * damp;
+    this.diorama.sunHaloMat.opacity +=
+      (targetHaloOp - this.diorama.sunHaloMat.opacity) * damp;
+
     const targetBeamOpacity =
       this.activeStage === 'evaporasi'
-        ? 0.22
+        ? 0.24
         : this.activeStage === 'transpirasi'
-          ? 0.13
+          ? 0.14
           : this.activeStage === 'presipitasi'
             ? 0.02
-            : 0.1;
+            : 0.12;
     this.diorama.sunBeamMat.opacity += (targetBeamOpacity - this.diorama.sunBeamMat.opacity) * damp;
-    const targetSunEmissive =
-      this.activeStage === 'evaporasi' ? 2.2 : this.activeStage === 'presipitasi' ? 1.0 : 1.75;
-    this.diorama.sunCoreMat.emissiveIntensity +=
-      (targetSunEmissive - this.diorama.sunCoreMat.emissiveIntensity) * damp;
 
     this.diorama.oceanUniforms.uTime.value = elapsed;
-    const targetWaveAmp = this.activeStage === 'presipitasi' ? 0.075 : 0.048;
+    const targetWaveAmp = this.activeStage === 'presipitasi' ? 0.125 : 0.088;
     this.diorama.oceanUniforms.uWaveAmp.value +=
       (targetWaveAmp - this.diorama.oceanUniforms.uWaveAmp.value) * damp;
+    const curWaveAmp = this.diorama.oceanUniforms.uWaveAmp.value;
 
     const targetEvapGlow =
       this.activeStage === 'evaporasi'
@@ -561,10 +600,130 @@ export class WaterCycleEngine {
     this.textures.waterNormalBump.offset.x = (elapsed * 0.045) % 1;
     this.textures.waterNormalBump.offset.y = (elapsed * 0.028) % 1;
 
-    this.diorama.boatGroup.position.y =
-      this.diorama.boatBasePos.y + Math.sin(elapsed * 1.9) * 0.032;
-    this.diorama.boatGroup.rotation.z = Math.sin(elapsed * 1.55 + 0.6) * 0.045;
-    this.diorama.boatGroup.rotation.x = Math.cos(elapsed * 1.3) * 0.035;
+    // Sync traditional fishing boat heave, pitch, and roll directly to the natural ocean swells
+    const bx = this.diorama.boatBasePos.x;
+    const bz = this.diorama.boatBasePos.z;
+    const hCenter = oceanWaveHeightAt(bx, bz, elapsed, curWaveAmp);
+    const hBow = oceanWaveHeightAt(bx + 0.55, bz - 0.18, elapsed, curWaveAmp);
+    const hStern = oceanWaveHeightAt(bx - 0.55, bz + 0.18, elapsed, curWaveAmp);
+    const hPort = oceanWaveHeightAt(bx - 0.12, bz - 0.32, elapsed, curWaveAmp);
+    const hStbd = oceanWaveHeightAt(bx + 0.12, bz + 0.32, elapsed, curWaveAmp);
+    this.diorama.boatGroup.position.y = this.diorama.boatBasePos.y + hCenter;
+    this.diorama.boatGroup.rotation.z = THREE.MathUtils.clamp((hBow - hStern) * 0.68, -0.18, 0.18);
+    this.diorama.boatGroup.rotation.x = THREE.MathUtils.clamp((hStbd - hPort) * 0.72, -0.16, 0.16);
+
+    // --- Animated Fisherman Busy Casting Net (Lempar Jala) & Hauling Catch (Tarik Ikan) ---
+    const rig = this.diorama.fishermanRig;
+    const cycle = (elapsed % 6.2) / 6.2; // 6.2s lively looping net-casting & hauling action
+    const netTargetX = 1.28;
+    const netTargetZ = 0.62;
+    let netX = 0.44;
+    let netY = 0.42;
+    let netZ = 0.18;
+    let netSpread = 0.24;
+    let netHeightScale = 0.85;
+    let netTiltZ = 0;
+
+    if (cycle < 0.2) {
+      // Phase 1: Wind-up & gather net while twisting torso back
+      const p = cycle / 0.2;
+      const e = THREE.MathUtils.smoothstep(p, 0, 1);
+      rig.torsoPivot.rotation.y = THREE.MathUtils.lerp(0.15, -0.78, e);
+      rig.torsoPivot.rotation.z = THREE.MathUtils.lerp(0.0, 0.18, e);
+      rig.leftArmPivot.rotation.set(-0.35, 0, -0.85 - e * 0.35);
+      rig.rightArmPivot.rotation.set(0.45, 0, -0.55 - e * 0.45);
+      netX = THREE.MathUtils.lerp(0.42, 0.28, e);
+      netY = THREE.MathUtils.lerp(0.44, 0.56, e);
+      netZ = THREE.MathUtils.lerp(0.14, 0.26, e);
+      netSpread = 0.22;
+      netHeightScale = 0.92;
+      rig.caughtFishGroup.visible = false;
+      rig.splashMat.opacity = 0;
+    } else if (cycle < 0.42) {
+      // Phase 2: Dynamic throw! Fisherman lunges forward as circular net arcs & blooms open over the sea
+      const p = (cycle - 0.2) / 0.22;
+      const e = 1 - Math.pow(1 - p, 2.2);
+      rig.torsoPivot.rotation.y = THREE.MathUtils.lerp(-0.78, 0.62, e);
+      rig.torsoPivot.rotation.z = THREE.MathUtils.lerp(0.18, -0.26, e);
+      rig.leftArmPivot.rotation.set(-0.25, 0, THREE.MathUtils.lerp(-1.2, 1.35, e));
+      rig.rightArmPivot.rotation.set(0.35, 0, THREE.MathUtils.lerp(-1.0, 1.48, e));
+      netX = THREE.MathUtils.lerp(0.28, netTargetX, p);
+      netZ = THREE.MathUtils.lerp(0.26, netTargetZ, p);
+      netY = THREE.MathUtils.lerp(0.56, 0.14, p) + Math.sin(p * Math.PI) * 0.88;
+      netSpread = THREE.MathUtils.lerp(0.24, 1.12, Math.pow(p, 0.72));
+      netHeightScale = THREE.MathUtils.lerp(0.9, 0.68, p);
+      netTiltZ = -Math.cos(p * Math.PI) * 0.42;
+      rig.caughtFishGroup.visible = false;
+      rig.splashMat.opacity = 0;
+    } else if (cycle < 0.56) {
+      // Phase 3: Splashdown onto ocean waves & net sinks slightly to trap fish
+      const p = (cycle - 0.42) / 0.14;
+      rig.torsoPivot.rotation.y = THREE.MathUtils.lerp(0.62, 0.35, p);
+      rig.torsoPivot.rotation.z = THREE.MathUtils.lerp(-0.26, -0.14, p);
+      rig.leftArmPivot.rotation.set(-0.15, 0, THREE.MathUtils.lerp(1.35, 0.88, p));
+      rig.rightArmPivot.rotation.set(0.2, 0, THREE.MathUtils.lerp(1.48, 0.96, p));
+      netX = netTargetX;
+      netZ = netTargetZ;
+      netY = THREE.MathUtils.lerp(0.14, -0.02, p);
+      netSpread = THREE.MathUtils.lerp(1.12, 0.92, p);
+      netHeightScale = THREE.MathUtils.lerp(0.68, 0.85, p);
+      rig.caughtFishGroup.visible = false;
+      // Expanding white water splash ring around cast net landing spot
+      rig.splashRing.position.set(netTargetX, 0.02, netTargetZ);
+      rig.splashRing.scale.setScalar(0.65 + p * 0.95);
+      rig.splashMat.opacity = Math.sin(p * Math.PI) * 0.82;
+    } else if (cycle < 0.9) {
+      // Phase 4: Busy hand-over-hand hauling! Fisherman pulls rope rhythmically bringing gleaming fish aboard
+      const p = (cycle - 0.56) / 0.34;
+      const pullWave = Math.sin(p * Math.PI * 6.0);
+      rig.torsoPivot.rotation.y = 0.25 + pullWave * 0.14;
+      rig.torsoPivot.rotation.z = 0.16 + pullWave * 0.12;
+      rig.leftArmPivot.rotation.set(-0.1, 0, 0.72 + pullWave * 0.48);
+      rig.rightArmPivot.rotation.set(0.15, 0, 0.72 - pullWave * 0.48);
+      netX = THREE.MathUtils.lerp(netTargetX, 0.46, p);
+      netZ = THREE.MathUtils.lerp(netTargetZ, 0.24, p);
+      netY = THREE.MathUtils.lerp(-0.02, 0.46, Math.pow(p, 1.45));
+      netSpread = THREE.MathUtils.lerp(0.92, 0.28, p);
+      netHeightScale = THREE.MathUtils.lerp(0.85, 1.08, p);
+      netTiltZ = 0.22 * (1 - p);
+      rig.caughtFishGroup.visible = p > 0.28;
+      rig.caughtFishGroup.rotation.y = elapsed * 9.0;
+      rig.splashMat.opacity = 0;
+    } else {
+      // Phase 5: Drop caught fish toward boat & gather net smoothly for next throw
+      const p = (cycle - 0.9) / 0.1;
+      rig.torsoPivot.rotation.y = THREE.MathUtils.lerp(0.25, 0.15, p);
+      rig.torsoPivot.rotation.z = THREE.MathUtils.lerp(0.16, 0.0, p);
+      rig.leftArmPivot.rotation.set(-0.2, 0, THREE.MathUtils.lerp(0.65, -0.85, p));
+      rig.rightArmPivot.rotation.set(0.25, 0, THREE.MathUtils.lerp(0.65, -0.55, p));
+      netX = THREE.MathUtils.lerp(0.46, 0.42, p);
+      netY = THREE.MathUtils.lerp(0.46, 0.44, p);
+      netZ = THREE.MathUtils.lerp(0.24, 0.14, p);
+      netSpread = THREE.MathUtils.lerp(0.28, 0.22, p);
+      netHeightScale = 0.92;
+      rig.caughtFishGroup.visible = p < 0.45;
+      rig.splashMat.opacity = 0;
+    }
+
+    rig.netGroup.position.set(netX, netY, netZ);
+    rig.netGroup.scale.set(netSpread, netHeightScale, netSpread);
+    rig.netGroup.rotation.z = netTiltZ;
+
+    // Stretch haul rope smoothly between fisherman's hands and net apex
+    _ropeStart.set(
+      0.32 + Math.sin(rig.torsoPivot.rotation.y) * 0.08,
+      0.43 - rig.torsoPivot.rotation.z * 0.18,
+      0.08 + Math.cos(rig.torsoPivot.rotation.y) * 0.06
+    );
+    _ropeEnd.set(netX, netY, netZ);
+    _ropeMid.addVectors(_ropeStart, _ropeEnd).multiplyScalar(0.5);
+    _ropeDir.subVectors(_ropeEnd, _ropeStart);
+    const ropeLen = Math.max(_ropeDir.length(), 0.001);
+    rig.ropeMesh.position.copy(_ropeMid);
+    rig.ropeMesh.scale.set(1, ropeLen, 1);
+    _ropeDir.divideScalar(ropeLen);
+    _ropeQuat.setFromUnitVectors(_yAxis, _ropeDir);
+    rig.ropeMesh.quaternion.copy(_ropeQuat);
 
     const targetAquiferEmissive =
       this.activeStage === 'infiltrasi' ? 1.55 : this.activeStage === 'overview' ? 0.72 : 0.45;
@@ -611,6 +770,7 @@ export class WaterCycleEngine {
     }
 
     this.particles.update(dt, elapsed, this.activeStage);
+    this.wildlife.update(dt, elapsed, this.activeStage);
   }
 
   private projectHotspots(): void {
@@ -664,6 +824,7 @@ export class WaterCycleEngine {
     this.controls.removeEventListener('start', this.onControlsStart);
     this.controls.dispose();
     this.particles.dispose();
+    this.wildlife.dispose();
     this.diorama.disposables.forEach((d) => d.dispose());
     this.textures.dispose();
     this.envRenderTarget.dispose();

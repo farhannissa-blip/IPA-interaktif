@@ -82,6 +82,7 @@ export const WaterCycleHUD: React.FC<WaterCycleHUDProps> = ({
     narrationState.isPlaying &&
     narrationState.stageId === activeStage &&
     narrationState.part === 'extra';
+  const isLiveExplaining = autoPlay || isPlayingMain || isPlayingExtra;
 
   return (
     <>
@@ -141,18 +142,49 @@ export const WaterCycleHUD: React.FC<WaterCycleHUDProps> = ({
           >
           {/* Upper Band: Contextual Grade-5 Curriculum Information */}
           <div className="px-4 sm:px-5 pt-3.5 pb-3 border-b border-white/10">
-            <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1.5">
-              <div className="flex items-baseline gap-2.5 min-w-0">
-                <span
-                  className="font-mono-tabular text-xs font-medium shrink-0"
-                  style={{ color: stage.accentHex }}
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5">
+              <div className="flex items-center gap-2.5 min-w-0 flex-wrap">
+                <div
+                  className="inline-flex items-center gap-2 px-2.5 py-1 rounded-lg border transition-all duration-300"
+                  style={{
+                    borderColor: isLiveExplaining ? stage.accentHex : `${stage.accentHex}55`,
+                    backgroundColor: isLiveExplaining
+                      ? `${stage.accentHex}26`
+                      : `${stage.accentHex}12`,
+                    boxShadow: isLiveExplaining
+                      ? `0 0 18px ${stage.accentHex}44`
+                      : 'none',
+                  }}
                 >
-                  {stage.stepNumber} / 05
-                </span>
-                <h2 className="font-display text-xl sm:text-2xl font-semibold text-[#f8f4ec] leading-tight truncate">
-                  {stage.title}
-                </h2>
-                <span className="hidden md:inline text-xs text-[#9cb0c9] truncate">
+                  <span className="relative flex h-2.5 w-2.5 shrink-0">
+                    {isLiveExplaining && (
+                      <span
+                        className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-80"
+                        style={{ backgroundColor: stage.accentHex }}
+                      />
+                    )}
+                    <span
+                      className="relative inline-flex rounded-full h-2.5 w-2.5"
+                      style={{ backgroundColor: stage.accentHex }}
+                    />
+                  </span>
+                  <span
+                    className="font-mono-tabular text-xs font-bold shrink-0"
+                    style={{ color: stage.accentHex }}
+                  >
+                    {stage.stepNumber} / 05
+                  </span>
+                  <h2
+                    className="font-display text-lg sm:text-xl font-bold leading-tight truncate"
+                    style={{
+                      color: '#ffffff',
+                      textShadow: isLiveExplaining ? `0 0 12px ${stage.accentHex}88` : 'none',
+                    }}
+                  >
+                    {stage.title}
+                  </h2>
+                </div>
+                <span className="hidden md:inline text-xs text-[#b5c7dd] truncate">
                   — {stage.indonesianSubtitle}
                 </span>
               </div>
@@ -167,8 +199,17 @@ export const WaterCycleHUD: React.FC<WaterCycleHUDProps> = ({
               </div>
             </div>
 
-            <div className="mt-1.5 flex flex-col sm:flex-row sm:items-end justify-between gap-2">
-              <p className="text-xs sm:text-[13.5px] leading-relaxed text-[#dbe3ee] max-w-3xl">
+            <div className="mt-2 flex flex-col sm:flex-row sm:items-end justify-between gap-2">
+              <p
+                className={`text-xs sm:text-[13.5px] leading-relaxed max-w-3xl transition-all duration-300 ${
+                  isLiveExplaining
+                    ? 'text-white pl-2.5 border-l-2'
+                    : 'text-[#dbe3ee]'
+                }`}
+                style={{
+                  borderLeftColor: isLiveExplaining ? stage.accentHex : 'transparent',
+                }}
+              >
                 {stage.summary}
               </p>
               <div className="flex items-center gap-3 shrink-0 self-start sm:self-end">
@@ -267,6 +308,7 @@ export const WaterCycleHUD: React.FC<WaterCycleHUDProps> = ({
                 {STAGE_ORDER.map((id) => {
                   const s = WATER_CYCLE_STAGES[id];
                   const isActive = activeStage === id;
+                  const isActiveLive = isActive && isLiveExplaining;
                   return (
                     <button
                       key={id}
@@ -274,13 +316,40 @@ export const WaterCycleHUD: React.FC<WaterCycleHUDProps> = ({
                       role="tab"
                       aria-selected={isActive}
                       onClick={() => onSelectStage(id)}
-                      className={`px-2.5 sm:px-3 h-9 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer border ${
+                      style={
                         isActive
-                          ? 'bg-[#17263d] text-[#fbf8f1] border-[#d4af6a]/70'
-                          : 'bg-transparent text-[#a8b8cd] border-transparent hover:text-white hover:bg-white/6'
+                          ? {
+                              borderColor: s.accentHex,
+                              backgroundColor: isActiveLive ? `${s.accentHex}33` : `${s.accentHex}20`,
+                              boxShadow: isActiveLive
+                                ? `0 0 16px ${s.accentHex}55, inset 0 0 0 1px ${s.accentHex}44`
+                                : `0 0 8px ${s.accentHex}28`,
+                            }
+                          : undefined
+                      }
+                      className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 h-9 rounded-lg text-xs transition-all duration-200 whitespace-nowrap shrink-0 cursor-pointer border ${
+                        isActive
+                          ? 'text-white font-bold'
+                          : 'bg-transparent text-[#9eb0c6] font-medium border-transparent hover:text-white hover:bg-white/6'
                       }`}
                     >
-                      {id === 'overview' ? 'Utuh' : `${Number(s.stepNumber)}. ${s.shortLabel}`}
+                      {isActive && (
+                        <span className="relative flex h-2 w-2 shrink-0">
+                          {isActiveLive && (
+                            <span
+                              className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-80"
+                              style={{ backgroundColor: s.accentHex }}
+                            />
+                          )}
+                          <span
+                            className="relative inline-flex rounded-full h-2 w-2"
+                            style={{ backgroundColor: s.accentHex }}
+                          />
+                        </span>
+                      )}
+                      <span>
+                        {id === 'overview' ? 'Utuh' : `${Number(s.stepNumber)}. ${s.shortLabel}`}
+                      </span>
                     </button>
                   );
                 })}

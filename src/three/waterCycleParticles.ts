@@ -3,8 +3,13 @@ import { WaterCycleStageId } from '../data/waterCycleData';
 import { ProceduralTextureSet } from './proceduralTextures';
 import {
   DIORAMA_HALF_Z,
+  RIVER_CASCADE_X,
+  RIVER_END_X,
+  RIVER_START_X,
   WATER_LEVEL,
   riverCenterZ,
+  riverHalfWidth,
+  riverSlopeDZDX,
   riverWaterSurfaceY,
   terrainHeightAt,
 } from './terrainMath';
@@ -152,7 +157,7 @@ export class WaterCycleParticleSystem {
     this.evapMesh.frustumCulled = false;
     for (let i = 0; i < evapCount; i++) {
       this.evapSeeds.push({
-        x: 2.0 + Math.random() * 3.1,
+        x: 2.35 + Math.random() * 5.65,
         y: Math.random(),
         z: (Math.random() - 0.5) * 6.4,
         speed: 0.14 + Math.random() * 0.14,
@@ -184,7 +189,7 @@ export class WaterCycleParticleSystem {
     this.evapMistPoints.renderOrder = 8;
     for (let i = 0; i < evapMistCount; i++) {
       this.evapMistSeeds.push({
-        x: 2.1 + Math.random() * 2.9,
+        x: 2.35 + Math.random() * 5.5,
         y: Math.random(),
         z: (Math.random() - 0.5) * 6.0,
         speed: 0.09 + Math.random() * 0.08,
@@ -361,10 +366,12 @@ export class WaterCycleParticleSystem {
     this.splashMesh = new THREE.InstancedMesh(ringGeo, this.splashMat, splashCount);
     this.splashMesh.frustumCulled = false;
     for (let i = 0; i < splashCount; i++) {
-      const rx = -2.2 + Math.random() * 4.8;
-      const rz =
-        rx < 1.6 ? riverCenterZ(rx) + (Math.random() - 0.5) * 0.45 : (Math.random() - 0.5) * 5.2;
-      const surfaceY = rx < 1.65 ? riverWaterSurfaceY(rx) + 0.035 : WATER_LEVEL + 0.04;
+      const rx = THREE.MathUtils.lerp(RIVER_START_X + 0.55, 7.2, Math.random());
+      const onRiver = rx < RIVER_END_X - 0.35;
+      const rz = onRiver
+        ? riverCenterZ(rx) + (Math.random() - 0.5) * riverHalfWidth(rx) * 1.15
+        : (Math.random() - 0.5) * 5.2;
+      const surfaceY = onRiver ? riverWaterSurfaceY(rx) + 0.035 : WATER_LEVEL + 0.04;
       this.splashSeeds.push({
         x: rx,
         y: Math.random(),
@@ -437,9 +444,10 @@ export class WaterCycleParticleSystem {
     }
     this.group.add(this.runoffMesh);
 
-    // Delicate waterfall spray mist rising from base of cliff waterfall
+    // Delicate spray mist rising from the steepest natural valley cascade
     const wfMistCount = 22;
-    const wfZ = riverCenterZ(-1.12);
+    const wfZ = riverCenterZ(RIVER_CASCADE_X);
+    const wfY = riverWaterSurfaceY(RIVER_CASCADE_X) + 0.05;
     this.waterfallMistPos = new Float32Array(wfMistCount * 3);
     this.waterfallMistGeo = new THREE.BufferGeometry();
     this.waterfallMistGeo.setAttribute(
@@ -462,14 +470,14 @@ export class WaterCycleParticleSystem {
     this.waterfallMistPoints.renderOrder = 8;
     for (let i = 0; i < wfMistCount; i++) {
       this.waterfallMistSeeds.push({
-        x: -1.12 + (Math.random() - 0.5) * 0.55,
+        x: RIVER_CASCADE_X + (Math.random() - 0.5) * 0.65,
         y: Math.random(),
         z: wfZ + (Math.random() - 0.5) * 0.55,
         speed: 0.25 + Math.random() * 0.18,
         phase: Math.random() * Math.PI * 2,
         radius: 0.14 + Math.random() * 0.18,
         scale: 1,
-        groundY: 0.25,
+        groundY: wfY,
       });
     }
     this.group.add(this.waterfallMistPoints);
@@ -907,13 +915,18 @@ export class WaterCycleParticleSystem {
       const s = this.runoffSeeds[i];
       s.y = (s.y + dt * s.speed * flowSpeedMult) % 1;
       const t = s.y;
-      const x = THREE.MathUtils.lerp(-3.4, 2.35, t);
-      const z = riverCenterZ(x) + s.z * (0.4 + t * 0.75);
-      const y = riverWaterSurfaceY(x) + 0.055;
+      const cx = THREE.MathUtils.lerp(RIVER_START_X + 0.14, RIVER_END_X - 0.08, t);
+      const cz = riverCenterZ(cx);
+      const dzdx = riverSlopeDZDX(cx);
+      const invLen = 1 / Math.hypot(1, dzdx);
+      const lateral = s.z * riverHalfWidth(cx) * 1.15;
+      const px = cx - dzdx * invLen * lateral;
+      const pz = cz + invLen * lateral;
+      const py = riverWaterSurfaceY(px) + 0.055;
       const fade = Math.sin(t * Math.PI);
       const sc = s.scale * (0.45 + wInfil * 0.65) * (0.3 + 0.7 * fade);
 
-      _dummy.position.set(x, y, z);
+      _dummy.position.set(px, py, pz);
       _dummy.rotation.set(0, 0, 0);
       _dummy.scale.setScalar(sc);
       _dummy.updateMatrix();

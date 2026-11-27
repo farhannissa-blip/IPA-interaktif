@@ -317,6 +317,9 @@ export default function App() {
         {HOTSPOT_IDS.map((id) => {
           const st = WATER_CYCLE_STAGES[id];
           const isActive = activeStage === id;
+          const isExplainingNow =
+            isActive &&
+            (autoPlay || (narrationState.isPlaying && narrationState.stageId === id));
           return (
             <button
               key={id}
@@ -332,20 +335,49 @@ export default function App() {
               style={{
                 opacity: 0,
                 willChange: 'transform, opacity',
+                borderColor: isActive ? st.accentHex : undefined,
+                boxShadow: isActive
+                  ? isExplainingNow
+                    ? `0 0 0 2px ${st.accentHex}66, 0 0 24px ${st.accentHex}99, 0 8px 20px rgba(4,12,26,0.65)`
+                    : `0 0 0 1px ${st.accentHex}55, 0 0 16px ${st.accentHex}66, 0 6px 16px rgba(4,12,26,0.55)`
+                  : undefined,
+                backgroundColor: isActive ? 'rgba(9, 22, 42, 0.96)' : undefined,
               }}
-              className={`fixed top-0 left-0 flex items-center gap-2 px-2.5 py-1 rounded-md border transition-colors duration-200 cursor-pointer whitespace-nowrap ${
+              className={`fixed top-0 left-0 flex items-center gap-2 rounded-lg border transition-all duration-200 cursor-pointer whitespace-nowrap ${
                 isActive
-                  ? 'bg-[#0a1526]/94 border-[#d4af6a]/85 text-[#fbf8f1] shadow-lg'
-                  : 'bg-[#091220]/82 border-white/18 text-[#dce5f0] hover:border-[#d4af6a]/65 hover:text-white'
+                  ? 'px-3.5 py-1.5 text-white z-20'
+                  : 'px-2.5 py-1 bg-[#091220]/76 border-white/16 text-[#c7d6e8] hover:border-[#d4af6a]/65 hover:text-white'
               }`}
             >
+              {isActive && (
+                <span className="relative flex h-2.5 w-2.5 shrink-0">
+                  {isExplainingNow && (
+                    <span
+                      className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-80"
+                      style={{ backgroundColor: st.accentHex }}
+                    />
+                  )}
+                  <span
+                    className="relative inline-flex rounded-full h-2.5 w-2.5"
+                    style={{ backgroundColor: st.accentHex }}
+                  />
+                </span>
+              )}
               <span
-                className="font-mono-tabular text-[11px] font-medium"
+                className={`font-mono-tabular ${isActive ? 'text-xs font-bold' : 'text-[11px] font-medium'}`}
                 style={{ color: st.accentHex }}
               >
                 {st.stepNumber}
               </span>
-              <span className="text-xs font-medium tracking-wide">{st.shortLabel}</span>
+              <span
+                className={
+                  isActive
+                    ? 'text-[13px] font-bold tracking-wide text-white'
+                    : 'text-xs font-medium tracking-wide'
+                }
+              >
+                {st.shortLabel}
+              </span>
             </button>
           );
         })}
